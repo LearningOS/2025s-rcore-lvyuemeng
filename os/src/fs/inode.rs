@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -52,6 +52,36 @@ impl OSInode {
             v.extend_from_slice(&buffer[..len]);
         }
         v
+    }
+    /// Add a new link for the inode
+    pub fn add_link(&self, name: &str, new_name:&str)-> Option<()>{
+        let inner = self.inner.exclusive_access();
+        inner.inode.add_link(name, new_name)
+    }
+    /// Add a new link for the inode
+    pub fn remove_link(&self, name: &str)-> Option<()>{
+        let inner = self.inner.exclusive_access();
+        inner.inode.remove_link(name)
+    }
+    /// Check if current inode is a directory
+    pub fn is_dir(&self) -> bool {
+        let inner = self.inner.exclusive_access();
+        inner.inode.is_dir()
+    }
+    /// Check if current inode is a file 
+    pub fn is_file(&self) -> bool {
+        let inner = self.inner.exclusive_access();
+        inner.inode.is_file()
+    }
+    /// Link numbers
+    pub fn nlink(&self) -> u32 {
+        let inner = self.inner.exclusive_access();
+        inner.inode.nlink()
+    }
+    /// Get the inode number
+    pub fn ino(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.inode.block_id()
     }
 }
 
@@ -125,6 +155,16 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// Add a link for the file
+pub fn add_link(name: &str, new_name:&str) -> Option<()> {
+    ROOT_INODE.add_link(name, new_name)
+}
+
+/// Remove a link for the file
+pub fn remove_link(name: &str) -> Option<()> {
+    ROOT_INODE.remove_link(name)
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -155,5 +195,22 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> Option<Stat> {
+        let mode = if self.is_dir() {
+            super::StatMode::DIR
+        } else if self.is_file()  {
+            super::StatMode::FILE
+        } else {
+            super::StatMode::NULL
+        };
+
+        Some(Stat {
+            dev:0,
+            ino: self.ino() as u64,
+            mode,
+            nlink: self.nlink(),
+            pad: [0; 7],
+        })
     }
 }

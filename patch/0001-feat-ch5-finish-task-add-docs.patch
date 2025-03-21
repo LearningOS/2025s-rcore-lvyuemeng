@@ -1,0 +1,1085 @@
+From 73f264c43c96d1b1412a6207ce69b1e823dd64f1 Mon Sep 17 00:00:00 2001
+From: lvyuemeng <lv15623448685@gmail.com>
+Date: Sat, 5 Apr 2025 16:07:16 +0800
+Subject: [PATCH] feat(ch5): finish task, add docs
+
+---
+ os/src/config.rs          |   6 ++
+ os/src/mm/memory_set.rs   |  57 +++++++++++++-
+ os/src/mm/mod.rs          |   2 +-
+ os/src/mm/page_table.rs   |  40 +++++++++-
+ os/src/syscall/fs.rs      |  12 ++-
+ os/src/syscall/process.rs |  64 +++++++++++----
+ os/src/task/id.rs         |   2 +-
+ os/src/task/manager.rs    |  64 ++++++++++++++-
+ os/src/task/mod.rs        |  54 ++++++++++++-
+ os/src/task/processor.rs  |  12 +++
+ os/src/task/task.rs       | 158 +++++++++++++++++++++++++++++++++++++-
+ reports/lab1.md           |  85 ++++++++++++++++++++
+ reports/lab2.md           | 128 ++++++++++++++++++++++++++++++
+ reports/lab3.md           |  63 +++++++++++++++
+ 14 files changed, 712 insertions(+), 35 deletions(-)
+ create mode 100644 reports/lab1.md
+ create mode 100644 reports/lab2.md
+ create mode 100644 reports/lab3.md
+
+diff --git a/os/src/config.rs b/os/src/config.rs
+index 71d4a5e..b88a2d6 100644
+--- a/os/src/config.rs
++++ b/os/src/config.rs
+@@ -21,3 +21,9 @@ pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
+ pub const CLOCK_FREQ: usize = 12500000;
+ /// the physical memory end
+ pub const MEMORY_END: usize = 0x88000000;
++
++/// the stride for priority.
++pub const BIG_STRIDE:usize = 0x100000;
++
++/// the priority
++pub const PRIORITY: usize = 0x16;
+\ No newline at end of file
+diff --git a/os/src/mm/memory_set.rs b/os/src/mm/memory_set.rs
+index c3d15f3..dc49a96 100644
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -48,19 +48,72 @@ impl MemorySet {
+     pub fn token(&self) -> usize {
+         self.page_table.token()
+     }
++
++    #[allow(unused)]
++    fn overlap_with(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
++        self.areas.iter().any(|a| {
++            let a_start = a.vpn_range.get_start();
++            let a_end = a.vpn_range.get_end();
++            start_va.floor() < a_end && end_va.ceil() > a_start
++        })
++    }
+     /// Assume that no conflicts.
+     pub fn insert_framed_area(
+         &mut self,
+         start_va: VirtAddr,
+         end_va: VirtAddr,
+         permission: MapPermission,
+-    ) {
++    ) -> Result<(), isize> {
++        if !start_va.aligned() {
++            println!("[memory-set]: align failed for start va");
++            return Err(-1);
++        }
++
++        if end_va <= start_va {
++            return Err(-1);
++        }
++
++        let end_va = end_va.ceil().into();
++
++        if self.overlap_with(start_va, end_va) {
++            println!("[memory-set]: insert area with overlap.");
++            return Err(-1);
++        }
+         self.push(
+             MapArea::new(start_va, end_va, MapType::Framed, permission),
+             None,
+         );
++        Ok(())
++    }
++
++    /// remove a area with specified range.
++    pub fn remove_area_with_range(
++        &mut self,
++        start_va: VirtAddr,
++        end_va: VirtAddr,
++    ) -> Result<(),isize> {
++        if !start_va.aligned() {
++            println!("[memory-set]: align failed for start va");
++            return Err(-1);
++        }
++
++        if end_va <= start_va {
++            return Err(-1);
++        }
++
++        if let Some(index) = self.areas.iter().position(|a| {
++            a.vpn_range.get_start() == start_va.floor()
++                && a.vpn_range.get_end() == end_va.ceil()
++                && a.map_type == MapType::Framed
++        }) {
++            let mut a = self.areas.remove(index);
++            a.unmap(&mut self.page_table);
++            Ok(())
++        }  else {
++             Err(-1)
++        }
+     }
+-    /// remove a area
++    /// remove a area with specified start_vpn.
+     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
+         if let Some((idx, area)) = self
+             .areas
+diff --git a/os/src/mm/mod.rs b/os/src/mm/mod.rs
+index d216861..ee1a387 100644
+--- a/os/src/mm/mod.rs
++++ b/os/src/mm/mod.rs
+@@ -16,7 +16,7 @@ use address::{StepByOne, VPNRange};
+ pub use frame_allocator::{frame_alloc, FrameTracker};
+ pub use memory_set::remap_test;
+ pub use memory_set::{MapPermission, MemorySet, KERNEL_SPACE};
+-pub use page_table::{translated_byte_buffer, translated_refmut, translated_str, PageTableEntry};
++pub use page_table::{translated_byte_buffer, translated_refmut, translated_str, PageTableEntry,get_mut_data};
+ use page_table::{PTEFlags, PageTable};
+ /// initiate heap allocator, frame allocator and kernel space
+ pub fn init() {
+diff --git a/os/src/mm/page_table.rs b/os/src/mm/page_table.rs
+index 47917e7..4183490 100644
+--- a/os/src/mm/page_table.rs
++++ b/os/src/mm/page_table.rs
+@@ -1,4 +1,6 @@
+ //! Implementation of [`PageTableEntry`] and [`PageTable`].
++use crate::config;
++
+ use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+ use alloc::string::String;
+ use alloc::vec;
+@@ -161,15 +163,26 @@ impl PageTable {
+ }
+ 
+ /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
+-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
++pub fn translated_byte_buffer(
++    token: usize,
++    ptr: *const u8,
++    len: usize,
++) -> Option<Vec<&'static mut [u8]>> {
+     let page_table = PageTable::from_token(token);
+     let mut start = ptr as usize;
++    if start > config::MEMORY_END {
++        return None;
++    }
+     let end = start + len;
+     let mut v = Vec::new();
+     while start < end {
+         let start_va = VirtAddr::from(start);
+         let mut vpn = start_va.floor();
+-        let ppn = page_table.translate(vpn).unwrap().ppn();
++        let Some(pte) = page_table.translate(vpn) else {
++            println!("[pt]: find pte failed");
++            return None
++        };
++        let ppn = pte.ppn();
+         vpn.step();
+         let mut end_va: VirtAddr = vpn.into();
+         end_va = end_va.min(VirtAddr::from(end));
+@@ -180,7 +193,28 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
+         }
+         start = end_va.into();
+     }
+-    v
++    Some(v)
++}
++
++/// Get data by copy from user space
++pub fn get_mut_data<T>(token: usize, ptr: *const T) -> Option<*mut T> {
++    let size = core::mem::size_of::<T>();
++    if size == 0 {
++        println!("[task]: get data with size == 0");
++        return None;
++    }
++
++    let Some(mut byte_buffers) = translated_byte_buffer(token, ptr as *const u8, size) else {
++        println!("[task]: get data failed");
++        return None;
++    };
++
++    if byte_buffers.iter().map(|b| b.len()).sum::<usize>() < size {
++        println!("[task]:get data with size < {}", size);
++        return None;
++    }
++
++    Some(byte_buffers[0].as_mut_ptr() as *mut T)
+ }
+ 
+ /// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
+diff --git a/os/src/syscall/fs.rs b/os/src/syscall/fs.rs
+index 497f659..a483202 100644
+--- a/os/src/syscall/fs.rs
++++ b/os/src/syscall/fs.rs
+@@ -11,14 +11,16 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
+     trace!("kernel:pid[{}] sys_write", current_task().unwrap().pid.0);
+     match fd {
+         FD_STDOUT => {
+-            let buffers = translated_byte_buffer(current_user_token(), buf, len);
++            let Some(buffers )= translated_byte_buffer(current_user_token(), buf, len) else {
++                panic!("sys_write: translated_byte_buffer failed!");
++            };
+             for buffer in buffers {
+                 print!("{}", core::str::from_utf8(buffer).unwrap());
+             }
+             len as isize
+         }
+         _ => {
+-            panic!("Unsupported fd in sys_write!");
++            panic!("sys_write: Unsupported fd!");
+         }
+     }
+ }
+@@ -39,14 +41,16 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
+                 }
+             }
+             let ch = c as u8;
+-            let mut buffers = translated_byte_buffer(current_user_token(), buf, len);
++            let Some(mut buffers )= translated_byte_buffer(current_user_token(), buf, len) else {
++                panic!("sys_read: translated_byte_buffer failed!");
++            };
+             unsafe {
+                 buffers[0].as_mut_ptr().write_volatile(ch);
+             }
+             1
+         }
+         _ => {
+-            panic!("Unsupported fd in sys_read!");
++            panic!("sys_read: Unsupported fd!");
+         }
+     }
+ }
+diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
+index 1631f39..7a8b4a4 100644
+--- a/os/src/syscall/process.rs
++++ b/os/src/syscall/process.rs
+@@ -3,11 +3,10 @@ use alloc::sync::Arc;
+ 
+ use crate::{
+     loader::get_app_data_by_name,
+-    mm::{translated_refmut, translated_str},
++    mm::{get_mut_data, translated_refmut, translated_str},
+     task::{
+-        add_task, current_task, current_user_token, exit_current_and_run_next,
+-        suspend_current_and_run_next,
+-    },
++        self, add_task, current_mmap, current_munmap, current_task, current_user_token, exit_current_and_run_next, suspend_current_and_run_next
++    }, timer::get_time_us,
+ };
+ 
+ #[repr(C)]
+@@ -106,29 +105,34 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+ /// HINT: You might reimplement it with virtual memory management.
+ /// HINT: What if [`TimeVal`] is splitted by two pages ?
+ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+-    trace!(
+-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+-        current_task().unwrap().pid.0
+-    );
+-    -1
++    let token = task::current_user_token();
++    let us = get_time_us();
++    let ts = get_mut_data(token, _ts).unwrap();
++    unsafe {
++        *ts = TimeVal {
++            sec: us / 1_000_000,
++            usec: us % 1_000_000,
++        }
++    }
++    0
+ }
+ 
+ /// YOUR JOB: Implement mmap.
+ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+     trace!(
+-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
++        "kernel:pid[{}] sys_mmap",
+         current_task().unwrap().pid.0
+     );
+-    -1
++    current_mmap(_start, _len, _port)
+ }
+ 
+ /// YOUR JOB: Implement munmap.
+ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+     trace!(
+-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
++        "kernel:pid[{}] sys_munmap",
+         current_task().unwrap().pid.0
+     );
+-    -1
++    current_munmap(_start, _len)
+ }
+ 
+ /// change data segment size
+@@ -143,12 +147,26 @@ pub fn sys_sbrk(size: i32) -> isize {
+ 
+ /// YOUR JOB: Implement spawn.
+ /// HINT: fork + exec =/= spawn
+-pub fn sys_spawn(_path: *const u8) -> isize {
++pub fn sys_spawn(path: *const u8) -> isize {
+     trace!(
+-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
++        "kernel:pid[{}] sys_spawn",
+         current_task().unwrap().pid.0
+     );
+-    -1
++    let token = current_user_token();
++    let path = translated_str(token, path);
++    if let Some(data) = get_app_data_by_name(path.as_str()) {
++        let task = current_task().unwrap();
++        let new_task = task.spawn(data);
++        let new_pid = new_task.pid.0;
++
++        let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
++        trap_cx.x[10] = 0;
++        // add new task to scheduler
++        add_task(new_task);
++        new_pid as isize
++    } else {
++        -1
++    }
+ }
+ 
+ // YOUR JOB: Set task priority.
+@@ -157,5 +175,17 @@ pub fn sys_set_priority(_prio: isize) -> isize {
+         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+         current_task().unwrap().pid.0
+     );
+-    -1
++    let Some(task) = current_task() else {
++        return -1;
++    };
++
++    if _prio < 2 {
++        println!("[kernel]: Priority must be >= 2, but got {}", _prio);
++        return -1;
++    }
++
++    let mut inner = task.inner_exclusive_access();
++    inner.set_priority(_prio as usize);
++    // println!("Set priority to {}, turn out be: {}", _prio, task.get_priority());
++    return _prio;
+ }
+diff --git a/os/src/task/id.rs b/os/src/task/id.rs
+index 5a67d4a..eb5f420 100644
+--- a/os/src/task/id.rs
++++ b/os/src/task/id.rs
+@@ -80,7 +80,7 @@ pub fn kstack_alloc() -> KernelStack {
+         kstack_bottom.into(),
+         kstack_top.into(),
+         MapPermission::R | MapPermission::W,
+-    );
++    ).unwrap();
+     KernelStack(kstack_id)
+ }
+ 
+diff --git a/os/src/task/manager.rs b/os/src/task/manager.rs
+index 99393a4..53e88dd 100644
+--- a/os/src/task/manager.rs
++++ b/os/src/task/manager.rs
+@@ -2,15 +2,58 @@
+ use super::TaskControlBlock;
+ use crate::sync::UPSafeCell;
+ use alloc::collections::VecDeque;
++use alloc::collections::BinaryHeap;
+ use alloc::sync::Arc;
+ use lazy_static::*;
++
++#[allow(unused)]
++trait TaskManager {
++    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>>;
++    fn add(&mut self, task: Arc<TaskControlBlock>);
++}
++
++pub struct TaskManagerHeap {
++    ///A array of `TaskControlBlock` that is thread-safe
++    ready_queue: BinaryHeap<Arc<TaskControlBlock>>,
++}
++
++impl TaskManagerHeap {
++    ///Creat an empty TaskManager
++    pub fn new() -> Self {
++        Self {
++            ready_queue: BinaryHeap::new(),
++        }
++    }
++
++    pub fn add(&mut self, task: Arc<TaskControlBlock>) {
++        self.ready_queue.push(task);
++    }
++    
++    pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
++        let t = self.ready_queue.pop();
++        // if let Some(ref t) = t {
++        //     println!("[task manager]: get task with stride {}",t.get_stride());
++        // }
++        t
++    }
++}
++
++impl TaskManager for TaskManagerHeap {
++    fn add(&mut self, task: Arc<TaskControlBlock>) {
++        TaskManagerHeap::add(self,task);
++    }
++    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
++        TaskManagerHeap::fetch(self)
++    }
++}
++
+ ///A array of `TaskControlBlock` that is thread-safe
+-pub struct TaskManager {
++pub struct TaskManagerDeque {
+     ready_queue: VecDeque<Arc<TaskControlBlock>>,
+ }
+ 
+ /// A simple FIFO scheduler.
+-impl TaskManager {
++impl TaskManagerDeque {
+     ///Creat an empty TaskManager
+     pub fn new() -> Self {
+         Self {
+@@ -27,10 +70,23 @@ impl TaskManager {
+     }
+ }
+ 
++impl TaskManager for TaskManagerDeque {
++    /// Add process back to ready queue
++    fn add(&mut self, task: Arc<TaskControlBlock>) {
++        TaskManagerDeque::add(self,task);
++    }
++    /// Take a process out of the ready queue
++    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
++        TaskManagerDeque::fetch(self)
++    }
++}
++
+ lazy_static! {
+     /// TASK_MANAGER instance through lazy_static!
+-    pub static ref TASK_MANAGER: UPSafeCell<TaskManager> =
+-        unsafe { UPSafeCell::new(TaskManager::new()) };
++    // pub static ref TASK_MANAGER: UPSafeCell<TaskManagerDeque> =
++    //     unsafe { UPSafeCell::new(TaskManagerDeque::new()) };
++    pub static ref TASK_MANAGER: UPSafeCell<TaskManagerHeap> =
++        unsafe { UPSafeCell::new(TaskManagerHeap::new()) };
+ }
+ 
+ /// Add process to ready queue
+diff --git a/os/src/task/mod.rs b/os/src/task/mod.rs
+index 283fa29..68f5920 100644
+--- a/os/src/task/mod.rs
++++ b/os/src/task/mod.rs
+@@ -21,10 +21,13 @@ mod switch;
+ #[allow(clippy::module_inception)]
+ mod task;
+ 
+-use crate::loader::get_app_data_by_name;
++use crate::{
++    loader::get_app_data_by_name,
++    mm::{MapPermission, VirtAddr},
++};
+ use alloc::sync::Arc;
+ use lazy_static::*;
+-pub use manager::{fetch_task, TaskManager};
++pub use manager::{fetch_task, TaskManagerDeque};
+ use switch::__switch;
+ pub use task::{TaskControlBlock, TaskStatus};
+ 
+@@ -35,6 +38,53 @@ pub use processor::{
+     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
+     Processor,
+ };
++
++/// Allocate `len` bytes of memory in cur task.
++pub fn current_mmap(start: usize, len: usize, prot: usize) -> isize {
++    if prot & !0x7 != 0 || prot & 0x7 == 0 {
++        println!("[task]: mmap failed: invalid prot bits.");
++        return -1;
++    }
++    let mut perm = MapPermission::U;
++    if prot & 0x1 != 0 {
++        perm |= MapPermission::R
++    }
++    if prot & 0x2 != 0 {
++        perm |= MapPermission::W
++    }
++    if prot & 0x4 != 0 {
++        perm |= MapPermission::X
++    }
++
++    let start_va = VirtAddr::from(start);
++    let end_va = VirtAddr::from(start + len);
++    let Some(task) = current_task() else {
++        return -1;
++    };
++    let mut inner = task.inner_exclusive_access();
++    // assume no conflicts
++    if let Err(_) = inner.memory_set.insert_framed_area(start_va, end_va, perm) {
++        return -1;
++    }
++    // println!("[task]: create mmap successfully.");
++    0
++}
++
++/// Deallocate `len` bytes of memory in cur task.
++pub fn current_munmap(start: usize, len: usize) -> isize {
++    let start_va = VirtAddr::from(start);
++    let end_va = VirtAddr::from(start+len);
++    let Some(task) = current_task() else {
++        return -1;
++    };
++    let mut inner = task.inner_exclusive_access();
++    // assume no conflicts
++    if let Err(_) = inner.memory_set.remove_area_with_range(start_va,end_va) {
++        return -1;
++    }
++    0
++}
++
+ /// Suspend the current 'Running' task and run the next task in task list.
+ pub fn suspend_current_and_run_next() {
+     // There must be an application running.
+diff --git a/os/src/task/processor.rs b/os/src/task/processor.rs
+index f05fa09..c5691bc 100644
+--- a/os/src/task/processor.rs
++++ b/os/src/task/processor.rs
+@@ -55,11 +55,23 @@ lazy_static! {
+ pub fn run_tasks() {
+     loop {
+         let mut processor = PROCESSOR.exclusive_access();
++        // if let Some(current_task) = processor.take_current() {
++        //     let mut task_inner = current_task.inner_exclusive_access();
++        //     if task_inner.task_status == TaskStatus::Ready {
++        //         task_inner.add_stride();
++        //         drop(task_inner);
++        //         // Re-enqueue the task
++        //         add_task(current_task);
++        //     } else {
++        //         drop(task_inner);
++        //     }
++        // }
+         if let Some(task) = fetch_task() {
+             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
+             // access coming task TCB exclusively
+             let mut task_inner = task.inner_exclusive_access();
+             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
++            task_inner.add_stride();
+             task_inner.task_status = TaskStatus::Running;
+             // release coming task_inner manually
+             drop(task_inner);
+diff --git a/os/src/task/task.rs b/os/src/task/task.rs
+index 1402c31..c2b4e2c 100644
+--- a/os/src/task/task.rs
++++ b/os/src/task/task.rs
+@@ -1,7 +1,7 @@
+ //! Types related to task management & Functions for completely changing TCB
+ use super::TaskContext;
+ use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
+-use crate::config::TRAP_CONTEXT_BASE;
++use crate::config::{self, PRIORITY, TRAP_CONTEXT_BASE};
+ use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+ use crate::sync::UPSafeCell;
+ use crate::trap::{trap_handler, TrapContext};
+@@ -24,6 +24,87 @@ pub struct TaskControlBlock {
+     inner: UPSafeCell<TaskControlBlockInner>,
+ }
+ 
++#[derive(Clone, Copy)]
++pub struct Pass {
++    pass: usize,
++    priority:usize,
++    stride: usize,
++}
++
++impl Pass {
++    #[allow(unused)]
++    fn new(priority: usize) -> Self {
++        Self {
++            pass: config::BIG_STRIDE / priority,
++            priority,
++            stride: 0,
++        }
++    }
++    
++    // get stride
++    pub fn get_stride(&self) -> usize {
++        self.stride
++    }
++
++    /// get pass for stride
++    pub fn get_pass(&self) -> usize {
++        self.pass
++    }
++    
++    /// get priority
++    pub fn get_priority(&self) -> usize {
++        self.priority
++    }
++
++    pub fn set_priority(&mut self, priority: usize) {
++        self.pass = config::BIG_STRIDE / priority;
++        self.priority = priority
++    }
++
++    pub fn add_stride(&mut self) {
++        self.stride = self.stride.wrapping_add(self.pass);
++        // println!("[pass]: add pass {}, result {}", self.pass, self.stride);
++    }
++}
++
++impl Default for Pass {
++    fn default() -> Self {
++        Self {
++            pass: config::BIG_STRIDE / PRIORITY,
++            priority: PRIORITY,
++            stride: 0,
++        }
++    }
++}
++
++impl PartialEq for TaskControlBlock {
++    fn eq(&self, other: &Self) -> bool {
++        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
++        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
++        self_stride == other_stride
++    }
++}
++
++impl PartialOrd for TaskControlBlock {
++    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
++        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
++        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
++        // reverse order
++        Some(self_stride.cmp(&other_stride).reverse())
++    }
++}
++
++impl Eq for TaskControlBlock {}
++
++impl Ord for TaskControlBlock {
++    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
++        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
++        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
++        // reverse order
++        self_stride.cmp(&other_stride).reverse()
++    }
++}
++
+ impl TaskControlBlock {
+     /// Get the mutable reference of the inner TCB
+     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+@@ -37,6 +118,9 @@ impl TaskControlBlock {
+ }
+ 
+ pub struct TaskControlBlockInner {
++    /// current stride has been passed
++    pub pass_data: Pass,
++
+     /// The physical page number of the frame where the trap context is placed
+     pub trap_cx_ppn: PhysPageNum,
+ 
+@@ -85,6 +169,14 @@ impl TaskControlBlockInner {
+     pub fn is_zombie(&self) -> bool {
+         self.get_status() == TaskStatus::Zombie
+     }
++    /// add stride
++    pub fn add_stride(&mut self) {
++        self.pass_data.add_stride();
++    }
++    
++    pub fn set_priority(&mut self, priority: usize) {
++        self.pass_data.set_priority(priority);
++    }
+ }
+ 
+ impl TaskControlBlock {
+@@ -108,6 +200,7 @@ impl TaskControlBlock {
+             kernel_stack,
+             inner: unsafe {
+                 UPSafeCell::new(TaskControlBlockInner {
++                    pass_data: Pass::default(),
+                     trap_cx_ppn,
+                     base_size: user_sp,
+                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+@@ -133,6 +226,55 @@ impl TaskControlBlock {
+         task_control_block
+     }
+ 
++    /// Load a new elf and fork a new process to run it.
++    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
++        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
++        let trap_cx_ppn = memory_set
++            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
++            .unwrap()
++            .ppn();
++        let mut parent_inner = self.inner_exclusive_access();
++
++        // alloc a pid and a kernel stack in kernel space
++        let pid_handle = pid_alloc();
++        let kernel_stack = kstack_alloc();
++        let kernel_stack_top = kernel_stack.get_top();
++        let task_control_block = Arc::new(TaskControlBlock {
++            pid: pid_handle,
++            kernel_stack,
++            inner: unsafe {
++                UPSafeCell::new(TaskControlBlockInner {
++                    pass_data: Pass::default(),
++                    trap_cx_ppn,
++                    base_size: user_sp,
++                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
++                    task_status: TaskStatus::Ready,
++                    memory_set,
++                    parent: Some(Arc::downgrade(self)),
++                    children: Vec::new(),
++                    exit_code: 0,
++                    heap_bottom: parent_inner.heap_bottom,
++                    program_brk: parent_inner.program_brk,
++                })
++            },
++        });
++        parent_inner.children.push(task_control_block.clone());
++
++        // modify kernel_sp in trap_cx
++        // **** access child PCB exclusively
++        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
++        *trap_cx = TrapContext::app_init_context(
++            entry_point,
++            user_sp,
++            KERNEL_SPACE.exclusive_access().token(),
++            self.kernel_stack.get_top(),
++            trap_handler as usize,
++        );
++        // **** release inner automatically
++
++        task_control_block
++    }
++
+     /// Load a new elf to replace the original application address space and start execution
+     pub fn exec(&self, elf_data: &[u8]) {
+         // memory_set with elf program headers/trampoline/trap context/user stack
+@@ -173,6 +315,7 @@ impl TaskControlBlock {
+             .unwrap()
+             .ppn();
+         // alloc a pid and a kernel stack in kernel space
++        let pass_data = parent_inner.pass_data;
+         let pid_handle = pid_alloc();
+         let kernel_stack = kstack_alloc();
+         let kernel_stack_top = kernel_stack.get_top();
+@@ -181,6 +324,7 @@ impl TaskControlBlock {
+             kernel_stack,
+             inner: unsafe {
+                 UPSafeCell::new(TaskControlBlockInner {
++                    pass_data,
+                     trap_cx_ppn,
+                     base_size: parent_inner.base_size,
+                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+@@ -211,6 +355,18 @@ impl TaskControlBlock {
+         self.pid.0
+     }
+ 
++    /// get priority
++    pub fn get_priority(&self) -> usize {
++        let inner = self.inner_exclusive_access();
++        inner.pass_data.get_priority()
++    }
++
++    /// get current stride
++    pub fn get_stride(&self) -> usize {
++        let inner = self.inner_exclusive_access();
++        inner.pass_data.get_stride()
++    }
++
+     /// change the location of the program break. return None if failed.
+     pub fn change_program_brk(&self, size: i32) -> Option<usize> {
+         let mut inner = self.inner_exclusive_access();
+diff --git a/reports/lab1.md b/reports/lab1.md
+new file mode 100644
+index 0000000..1dc3fc1
+--- /dev/null
++++ b/reports/lab1.md
+@@ -0,0 +1,85 @@
++## Lab 1
++
++### Conclusion
++
++Finish Task for `syscall record`.
++Add few `println` for debug.
++
++Thanks to assistant: Fontlos(for check `make` failed in workflow`), 洋洋, stone-san(for check `sleep` time problem); AI: DeepSeek.
++
++### Q1:
++
++> [rustsbi] RustSBI version 0.3.0-alpha.2, adapting to RISC-V SBI v1.0.0
++
++```
++/// 由于 rustsbi 的问题，该程序无法正确退出
++/// > rustsbi 0.2.0-alpha.1 已经修复，可以正常退出
++```
++
++So in current rustsbi, it will exit normally without any panic behavoir.
++
++Here the reference in output:
++```
++[kernel] PageFault in application, bad addr = 0x0, bad instruction = 0x804003a4, kernel killed it.
++[kernel] IllegalInstruction in application, kernel killed it.
++[kernel] IllegalInstruction in application, kernel killed it.
++```
++
++We can see it's identified as illegal instruction in Trap process.
++
++### Q2:
++
++#### (1):
++
++`sp` is the stack pointer which designed in `riscv`, currently it will point to `TrapContext` in `KernelStack`.
++
++// (refer DeepSeek)
++- restore from S-level to U-level.
++- restore from switch new TaskContext.
++
++#### (2):
++
++It load the stored CSR info from `TrapContext` to `t0-t2` register and then assign to CSR.
++
++- `sstatus`: store the privilege level of current OS.
++- `sepc`: store the addr of next instruction in U-level.
++- `sstratch`: a pointer for temporary storage that designed for storing `KernelStack` and `UserStack` currently it point to `UserStack`
++
++#### (3):
++
++Exception for `x0` and `x4`.
++- `x0`: hard code as 0.
++- `x4`: only for special case.
++
++#### (4):
++
++`sp` will point to `UserStack` and `sscratch` point to `KernelStack`.
++
++#### (5):
++
++- instruction: `sret`
++// (refer DeepSeek)
++- reason: `sret` will return the addr and modify CSR related state, in which it will change the level and return the `sepc` for U-level instruction.
++
++#### (6):
++
++`sp` will point to `KernelStack` and `sscratch` will point to `UserStack`.
++
++#### (7):
++
++// (refer DeepSeek, Oh! in Lab1!!)
++When U-level, app use `ecall` related, it will turn into Trap to S-level.
++
++## 荣誉准则
++
++1. 在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++《你交流的对象说明》
++
++2. 此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++《你参考的资料说明》
++
++3. 我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++4. 我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
+\ No newline at end of file
+diff --git a/reports/lab2.md b/reports/lab2.md
+new file mode 100644
+index 0000000..4171d41
+--- /dev/null
++++ b/reports/lab2.md
+@@ -0,0 +1,128 @@
++## Lab 2
++
++### Conclusion
++
++Finish Task：
++- `sys_mmap/sys_munmap`
++- `sys_trace/sys_get_time`
++- add `get_mut_data`
++- refactor check for `translate_byte_buffer`
++
++Thanks to:
++- AI: DeepSeek, Claude(Help to read panic info and provide suggestion for achieving `get_data` by `translate_byte_buffer`), Kimi(Help to provide page related infos of RISC-V)
++
++### Q1:
++
++Page Entry to bundle permission and physical page.
++
++![](/rCore-Blog/assets/Lab4-4.png)
++
++```rust
++pub fn ppn(&self) -> PhysPageNum {
++	(self.bits >> 10 & ((1usize << 44) - 1)).into()
++}
++pub fn flags(&self) -> PTEFlags {
++	PTEFlags::from_bits(self.bits as u8).unwrap()
++}
++```
++
++- `V`: valid or not.
++- `R/W/X`: control read/write/execution.
++- `U`: allowed by U-level to access.
++- `G`: global mapping that exist in all address spaces.
++- `A`(accessed): whether be accessed after set to zero.
++- `D`(Dirty): whether be modified after set to zero.
++
++### Q2:
++
++mcause(Thanks to DeepSeek):
++
++- Instruction Page Fault: cpu try to take instruction from unmapped page.
++- Load Page Fault: cpu try to load data from unmapped page.
++- Store/AMO Page Fault: cpu try to write data(or AMO) from unmapped page.
++
++`mtval`: store virtual address in error.
++`mepc`(spec): point to instruction address that trigger error.(s.t. `ld`,`lw`,`sw` etc...)
++
++---
++
++Benefit of Lazy Load(Thanks to Kimi):
++- Reduce memory load.
++- Reduce IO operations.
++- Speed start.(only load necessary code)
++- Reduce page swap(when no enough space, swap memory to disk.)
++
++Lazy Load of `mmap`:
++
++For 10GB allocation:
++
++$4\text{KB}*512 = 2\text{MB} \quad 4\text{KB}*512^2 = 1\text{GB}$
++$ 10 \text{GB}(\frac{1}{512} + \frac{1}{512^2}) = 20\text{MB} + 40\text{KB}$
++
++Implementation of Lazy Load:
++
++```rust
++pub struct MapArea {
++    vpn_range: VPNRange,
++	used: BTreeMap<VirtPageNum,FrameTracker>,
++    unused: Vec<VirtPageNum>,
++    map_type: MapType,
++    map_perm: MapPermission,
++}
++```
++when alloced, init as `unused`, then if operation take memory, we will really map it to one `FrameTracker`.
++
++---
++
++Behavoir of Swap(Thanks to DeepSeek):
++
++- the page `V` bits(valid) will be set to 0.
++- `RSW` is custom bits to indicate infos, in this case, it can be used to store `swap` info.
++  
++Workflow:
++- trigger `V` as 0.
++- `stval` will be routed to virtual address for this page.
++- Check `swap info to ensure.
++- Read memory and set new `ppn`, set `V` to 1.
++- Back to `mepc` and reimplement instructions.
++
++### Q3:
++
++**Side Channel Attack**(Thanks to DeepSeek):
++Based on hardware bugs or time, power consumption etc... infos, stealing data bypassing permission isolation.
++
++**Two-Page Table**(Informal Rather: **Kernel page-table isolation**-KPTI):
++Isolate kernel and user, so even cpu can't access kernel infos through user page table.
++
++**Single-Page Table**:
++Every tasks shared page table with Kernel space. But the map of kernel space is fixed for all tasks. Changing `satp` to load new `ppn` root.
++
++Restriction:
++Set `U` bits to restrict `U`-level behavoir.
++
++Benefit:
++- No need to change table to reduce operations in Trap.
++- Only maintain one table for simplicity.
++
++Switch Case:
++- Two-Page:
++  - U-level S-level switch, for example: Trap.
++- Single-Page:
++  - switch `satp` only when process switching.
++  - No need to switch U-level, S-level switching.
++
++## 荣誉准则
++
++1. 在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++《你交流的对象说明》
++
++2. 此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++《你参考的资料说明》
++
++3. 我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++4. 我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
++
++
+diff --git a/reports/lab3.md b/reports/lab3.md
+new file mode 100644
+index 0000000..c4edf78
+--- /dev/null
++++ b/reports/lab3.md
+@@ -0,0 +1,63 @@
++## Lab 3
++
++### Conclusion
++
++Finish Task：
++- Inherit lab2.
++- implement `sys_spawn`
++- implement stride dispatch algorithm(by `BinaryHeap`)
++
++Thanks to:
++- AI: DeepSeek(Thanks to checkout and exposit part of error message.)
++- Asistant: Fontlos, 华华(help to figure out vague ci-test info.)
++
++Suggestion: Hope to provide concrete info on ci-test, especially on `reports/lab*.md` format and which case failed. Especially when local test succeed but doesn't provide info to amid the gap.
++
++### Q1
++
++Cond: `pass = 10`. Store in `stride` in `u8`.
++`p1.stride = 255`, `p2.stride = 250`, if `p2` implement in one time slice, `p2` will be added and result a overflow and become smaller, result `260 mod 256 = 4`, which will again repeat in `p1`.
++
++If `priority >= 2`, then for one pass must be with bound `pass <= BIG_STRIDE/2"`, then `STRIDE_MAX - STRIDE_MIN <= BIG_STRIDE/2 - 0 <= BIG_STRIDE/2`
++
++Code design:
++
++```rust
++use core::cmp::Ordering;
++
++struct Stride(u64);
++
++impl PartialOrd for Stride {
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++		let self_stride = ....
++		let other_stride = ....
++		if self_stride.wrapping_sub(&other_stride) > BIG_STRIDE/2 {
++			// reverse
++			return Some(core::cmp::Greater);
++		}
++		Some(self_stride.cmp(&other_stride).reverse())
++    }
++}
++
++impl PartialEq for Stride {
++    fn eq(&self, other: &Self) -> bool {
++        false
++    }
++}
++```
++
++## 荣誉准则
++
++1. 在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++《你交流的对象说明》
++
++2. 此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++《你参考的资料说明》
++
++3. 我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++4. 我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
++
++
+-- 
+2.43.0
+

@@ -1,5 +1,5 @@
 //! File and filesystem-related syscalls
-use crate::fs::{make_pipe, open_file, OpenFlags, Stat};
+use crate::fs::{add_link, make_pipe, open_file, remove_link, OpenFlags, Stat};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
@@ -19,7 +19,10 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
-        file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        let Some(data) = translated_byte_buffer(token, buf, len) else {
+            return -1;
+        };
+        file.write(UserBuffer::new(data)) as isize
     } else {
         -1
     }
@@ -41,7 +44,10 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
         trace!("kernel: sys_read .. file.read");
-        file.read(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        let Some(data) = translated_byte_buffer(token, buf, len) else {
+            return -1;
+        };
+        file.read(UserBuffer::new(data)) as isize
     } else {
         -1
     }
@@ -109,17 +115,76 @@ pub fn sys_dup(fd: usize) -> isize {
 /// YOUR JOB: Implement fstat.
 pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
     trace!("kernel:pid[{}] sys_fstat NOT IMPLEMENTED", current_task().unwrap().pid.0);
-    -1
+    let token = current_user_token();
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    let inner  = task.inner_exclusive_access();
+    let Some(Some(file)) = inner.fd_table.get(_fd) else {
+        return -1;
+    };
+    
+    let Some(stat) = file.stat() else {
+        return -1;
+    };
+    let st_ptr = translated_refmut(token, _st);
+    *st_ptr = stat;
+    0
 }
 
 /// YOUR JOB: Implement linkat.
 pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
     trace!("kernel:pid[{}] sys_linkat NOT IMPLEMENTED", current_task().unwrap().pid.0);
-    -1
+    let token = current_user_token();
+    let old_path = translated_str(token, _old_name);
+    let new_path = translated_str(token, _new_name);
+
+    let Some(old_inode) = open_file(old_path.as_str(), OpenFlags::RDONLY) else {
+        log::debug!("[kernel]: add link: old file not exist");
+        return -1;
+    };
+
+    // is old path a directory?
+    if old_inode.is_dir() {
+        return -1;
+    }
+
+    // exist same file?
+    if open_file(new_path.as_str(), OpenFlags::RDONLY).is_some() {
+        log::debug!("[kernel]: add link: file for new name already exist");
+        return -1;
+    }
+
+    if let None = add_link(&old_path, &new_path) {
+        log::debug!("[kernel]: add link failed");
+        return -1;
+    }
+    log::debug!("[kernel]: add link: links {}", old_inode.nlink());
+    return 0;
 }
 
 /// YOUR JOB: Implement unlinkat.
 pub fn sys_unlinkat(_name: *const u8) -> isize {
     trace!("kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED", current_task().unwrap().pid.0);
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _name);
+
+    if let Some(inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        // is path a directory?
+        if inode.is_dir() {
+            return -1;
+        }
+
+        if let None = remove_link(path.as_str()) {
+            log::debug!("[kernel]: remove link failed");
+            return -1;
+        }
+
+        log::debug!( "[kernel]: remove links {}",inode.nlink());
+        return 0;
+    } else {
+        log::debug!("[kernel]: remove link: file not exist");
+        // file not exist
+        return -1;
+    }
 }

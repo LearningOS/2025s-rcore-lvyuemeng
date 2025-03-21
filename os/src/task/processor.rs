@@ -55,11 +55,23 @@ lazy_static! {
 pub fn run_tasks() {
     loop {
         let mut processor = PROCESSOR.exclusive_access();
+        // if let Some(current_task) = processor.take_current() {
+        //     let mut task_inner = current_task.inner_exclusive_access();
+        //     if task_inner.task_status == TaskStatus::Ready {
+        //         task_inner.add_stride();
+        //         drop(task_inner);
+        //         // Re-enqueue the task
+        //         add_task(current_task);
+        //     } else {
+        //         drop(task_inner);
+        //     }
+        // }
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            task_inner.add_stride();
             task_inner.task_status = TaskStatus::Running;
             // release coming task_inner manually
             drop(task_inner);

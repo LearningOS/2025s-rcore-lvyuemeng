@@ -5,16 +5,57 @@
 
 use super::TaskControlBlock;
 use crate::sync::UPSafeCell;
+use alloc::collections::binary_heap::BinaryHeap;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use lazy_static::*;
 
-pub struct TaskManager {
+#[allow(unused)]
+trait TaskManager {
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>>;
+    fn add(&mut self, task: Arc<TaskControlBlock>);
+}
+
+pub struct TaskManagerHeap {
+    ready_queue: BinaryHeap<Arc<TaskControlBlock>>,
+}
+
+impl TaskManagerHeap {
+    pub fn new() -> Self {
+        Self {
+            ready_queue: BinaryHeap::new(),
+        }
+    }
+
+    pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+        self.ready_queue.push(task);
+    }
+    
+    pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        let t = self.ready_queue.pop();
+        // if let Some(ref t) = t {
+        //     println!("[task manager]: get task with stride {}",t.get_stride());
+        // }
+        t
+    }
+}
+
+impl TaskManager for TaskManagerHeap {
+    fn add(&mut self, task: Arc<TaskControlBlock>) {
+        TaskManagerHeap::add(self,task);
+    }
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        TaskManagerHeap::fetch(self)
+    }
+}
+
+pub struct TaskManagerDeque {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 /// A simple FIFO scheduler.
-impl TaskManager {
+#[allow(unused)]
+impl TaskManagerDeque {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
         Self {
@@ -31,10 +72,20 @@ impl TaskManager {
     }
 }
 
+impl TaskManager for TaskManagerDeque {
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        TaskManagerDeque::fetch(self)
+    }
+
+    fn add(&mut self, task: Arc<TaskControlBlock>) {
+        TaskManagerDeque::add(self, task);
+    }
+}
+
 lazy_static! {
     /// TASK_MANAGER instance through lazy_static!
-    pub static ref TASK_MANAGER: UPSafeCell<TaskManager> =
-        unsafe { UPSafeCell::new(TaskManager::new()) };
+    pub static ref TASK_MANAGER: UPSafeCell<TaskManagerHeap> =
+        unsafe { UPSafeCell::new(TaskManagerHeap::new()) };
     /// PID2PCB instance (map of pid to pcb)
     pub static ref PID2TCB: UPSafeCell<BTreeMap<usize, Arc<TaskControlBlock>>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
