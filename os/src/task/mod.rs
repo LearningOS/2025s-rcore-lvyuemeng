@@ -14,6 +14,8 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use core::ops::AddAssign;
+
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
@@ -107,9 +109,10 @@ impl TaskManager {
     }
 
     fn cur_task_syscall_record(&self, syscall_id: usize) {
-        let inner = self.inner.exclusive_access();
-        let mut cur = inner.tasks[inner.current_task];
-        cur.syscall_cnts[syscall_id] += 1;
+        let mut inner = self.inner.exclusive_access();
+        let cur_id = inner.current_task;
+        let cur = &mut inner.tasks[cur_id];
+        cur.syscall_cnts[syscall_id].add_assign(1);
     }
 
     fn cur_task_syscall(&self, syscall_id: usize) -> usize {

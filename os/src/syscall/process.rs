@@ -1,9 +1,6 @@
 //! Process management syscalls
 use crate::{
-    task::{
-        cur_task_syscall, cur_task_syscall_record, exit_current_and_run_next,
-        suspend_current_and_run_next,
-    },
+    task::{cur_task_syscall, exit_current_and_run_next, suspend_current_and_run_next},
     timer::get_time_us,
 };
 
@@ -57,9 +54,10 @@ pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
             0
         }
         2 => {
-            let target_id = _id;
-            cur_task_syscall_record(target_id);
-            cur_task_syscall(_id) as isize
+            // cur_task_syscall_record(_id);
+            let res = cur_task_syscall(_id) as isize;
+            println!("kernel: syscall {} returns {}", _id, res);
+            res
         }
         _ => -1,
     }

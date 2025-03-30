@@ -22,7 +22,7 @@ const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_TRACE: usize = 410;
 
 /// Take a big num.
-pub const MAX_SYSCALL_NUM: usize = 1000;
+pub const MAX_SYSCALL_NUM: usize = 500;
 
 mod fs;
 mod process;
@@ -32,9 +32,11 @@ use process::*;
 
 use crate::task::cur_task_syscall_record;
 
+
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
     cur_task_syscall_record(syscall_id);
+    // println!("syscall_id: {}, call times: {}", syscall_id, cur_task_syscall(syscall_id));
 
     match syscall_id {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
