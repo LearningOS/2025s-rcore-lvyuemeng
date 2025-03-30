@@ -1,5 +1,12 @@
 ## Lab3
 
+### Conclusion
+
+Finish Task for `syscall record`.
+Add few `println` for debug.
+
+Thanks to assistant: Fontlos(for check `make` failed in workflow`), 洋洋, stone-san(for check `sleep` time problem); AI: DeepSeek.
+
 ### Q1:
 
 > [rustsbi] RustSBI version 0.3.0-alpha.2, adapting to RISC-V SBI v1.0.0
