@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{ MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -103,6 +104,51 @@ impl TaskManager {
         inner.tasks[cur].task_status = TaskStatus::Exited;
     }
 
+    fn current_mmap(&self, start:usize,len:usize,prot:usize) -> isize {
+        if prot & !0x7 !=0 || prot & 0x7 == 0 {
+            println!("[task]: mmap failed: invalid prot bits.");
+            return -1;
+        }
+        let mut perm = MapPermission::U;
+        if prot & 0x1 != 0 {perm |= MapPermission::R}
+        if prot & 0x2 != 0 {perm |= MapPermission::W}
+        if prot & 0x4 != 0 {perm |= MapPermission::X}
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        // assume no conflicts
+        if let Err(_) = inner.tasks[cur].memory_set.insert_framed_area(start_va, end_va, perm) {
+            println!("[task]: create mmap failed!");
+            return -1
+        }
+        // println!("[task]: create mmap successfully.");
+        0
+    }
+
+    fn current_munmap(&self, start:usize,len:usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        // assume no conflicts
+        if let Err(_) = inner.tasks[cur].memory_set.remove_framed_area(start_va, end_va) {
+            return -1
+        };
+        0
+    }
+
+    fn get_syscall(&self, task: usize, syscall_id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.tasks[task].syscalls[syscall_id]
+    }
+
+    fn add_syscall(&self, task: usize, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.tasks[task].syscalls[syscall_id] += 1
+    }
+
     /// Find next task to run and return task id.
     ///
     /// In this case, we only return the first `Ready` task in task list.
@@ -153,6 +199,37 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+}
+
+
+/// munmap in current task
+pub fn current_munmap(start:usize,len:usize) -> isize {
+    // println!("[task]: task munmap: start = {}, len = {}", start, len);
+    TASK_MANAGER.current_munmap(start,len)
+}
+
+/// mmap in current task
+pub fn current_mmap(start:usize,len:usize,port:usize) -> isize {
+    // println!("[task]: task mmap: start = {}, len = {}", start, len);
+    TASK_MANAGER.current_mmap(start,len,port)
+}
+
+/// Get syscall times for current task
+pub fn get_cur_syscall(syscall_id: usize) -> usize {
+    let cur = get_cur_task();
+    TASK_MANAGER.get_syscall(cur, syscall_id)
+}
+
+/// Add 1 for syscall times for current task
+pub fn add_cur_syscall(syscall_id: usize) {
+    let cur = get_cur_task();
+    TASK_MANAGER.add_syscall(cur, syscall_id)
+}
+
+/// Get the current running task's id
+pub fn get_cur_task() -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.current_task
 }
 
 /// Run the first task in task list.

@@ -1,103 +1,78 @@
-## Chapter 1
+## Lab3
 
-### Execution Environment
+### Q1:
 
-![Execution Environment](/rCore-Blog/assets/lab1-1.png)
+> [rustsbi] RustSBI version 0.3.0-alpha.2, adapting to RISC-V SBI v1.0.0
 
-The execution environment is defined by the **Target Triplet**, which specifies the platform, CPU architecture, and library required for the build. For example: `x86_64-unknown-linux-gnu`.
-
-**Components of the Target Triplet:**
-- **Platform**: The specific operating system or runtime environment.
-- **CPU Architecture**: The underlying hardware architecture (e.g., x86_64, ARM).
-- **Library**: The standard library or runtime support required.
-
-If the target platform contains no `std` or any support syscall, such platform called **bare-metal**, `Rust` contains a `core` lib independent of any platform support.
-
-If we change `.cargo/config` s.t.:
-```toml
-# os/.cargo/config
-[build]
-target = "riscv64gc-unknown-none-elf"
 ```
-it called **cross compile** because the running platform is different form execution platform.
-
-#### *No Std* and *No Main*
-
-The basic functionality provided by `std` and `start` semantic is `panic_handler` and `main` entry. 
-
-To toggle it off with:
-```rust
-#![no_std]
-#![no_main]
+/// 由于 rustsbi 的问题，该程序无法正确退出
+/// > rustsbi 0.2.0-alpha.1 已经修复，可以正常退出
 ```
 
-#### RISCV
+So in current rustsbi, it will exit normally without any panic behavoir.
 
-As for riscv, thing will be tough in here, we need to complete our own entry point, exit, and basic functionality like `print/println`. 
-
-First, we need to define `linker` and `entry` for stack allocation.
-
-Linker:
-```bash
-# os/src/linker.ld
-OUTPUT_ARCH(riscv)
-ENTRY(_start) # entry point
-BASE_ADDRESS = 0x80200000; # base addr for entry
-
-SECTIONS
-...
+Here the reference in output:
+```
+[kernel] PageFault in application, bad addr = 0x0, bad instruction = 0x804003a4, kernel killed it.
+[kernel] IllegalInstruction in application, kernel killed it.
+[kernel] IllegalInstruction in application, kernel killed it.
 ```
 
-Stack Space:
-```bash
-# os/src/entry.asm
-    .section .text.entry
-    .globl _start
-_start:
-    la sp, boot_stack_top
-    call rust_main # call rust_main function as entry 
+We can see it's identified as illegal instruction in Trap process.
 
-    .section .bss.stack
-    .globl boot_stack_lower_bound
-boot_stack_lower_bound:
-    .space 4096 * 16
-    .globl boot_stack_top
-boot_stack_top:
-```
+### Q2:
 
-For riscv, we need to call `RustSBI`(a underlying specification for rust in riscv).
+#### (1):
 
-After implement `sbi_call`, we could construct `put_char`:
-```rust
-const SBI_CONSOLE_PUTCHAR: usize = 1;
+`sp` is the stack pointer which designed in `riscv`, currently it will point to `TrapContext` in `KernelStack`.
 
-fn sbi_call(...) -> usize {
-	...
-}
+// (refer DeepSeek)
+- restore from S-level to U-level.
+- restore from switch new TaskContext.
 
-pub fn console_putchar(c:usize) {
-	sbi_call(SBI_CONSOLE_PUTCHAR,c,0,0)
-}
-```
+#### (2):
 
-With a formal interface for `write`:
-```rust
-struct Stdout;
+It load the stored CSR info from `TrapContext` to `t0-t2` register and then assign to CSR.
 
-impl Write for Stdout {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.chars() {
-            console_putchar(c as usize);
-        }
-        Ok(())
-    }
-}
+- `sstatus`: store the privilege level of current OS.
+- `sepc`: store the addr of next instruction in U-level.
+- `sstratch`: a pointer for temporary storage that designed for storing `KernelStack` and `UserStack` currently it point to `UserStack`
 
-pub fn print(args: fmt::Arguments) {
-    Stdout.write_fmt(args).unwrap();
-}
-```
+#### (3):
 
-Now we construct basic functionality in `println`, you could also handle `panic_handler` and others...
+Exception for `x0` and `x4`.
+- `x0`: hard code as 0.
+- `x4`: only for special case.
 
+#### (4):
 
+`sp` will point to `UserStack` and `sscratch` point to `KernelStack`.
+
+#### (5):
+
+- instruction: `sret`
+// (refer DeepSeek)
+- reason: `sret` will return the addr and modify CSR related state, in which it will change the level and return the `sepc` for U-level instruction.
+
+#### (6):
+
+`sp` will point to `KernelStack` and `sscratch` will point to `UserStack`.
+
+#### (7):
+
+// (refer DeepSeek, Oh! in Lab1!!)
+When U-level, app use `ecall` related, it will turn into Trap to S-level.
+
+## 荣誉准则
+
+1. 在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
+
+《你交流的对象说明》
+
+2. 此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
+
+《你参考的资料说明》
+
+3. 我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
+
+4. 我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
