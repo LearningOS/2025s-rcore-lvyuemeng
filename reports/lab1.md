@@ -1,4 +1,11 @@
-## Lab3
+## Lab1
+
+### Conclusion
+
+Finish Task for `syscall record`.
+Add few `println` for debug.
+
+Thanks to assistant: Fontlos(for check `make` failed in workflow`), 洋洋, stone-san(for check `sleep` time problem); AI: DeepSeek.
 
 ### Q1:
 

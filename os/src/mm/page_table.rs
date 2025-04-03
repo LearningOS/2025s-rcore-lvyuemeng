@@ -169,7 +169,7 @@ pub fn translated_byte_buffer(
 ) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
-    if start > config::MEMORY_END {
+    if start + len >= config::MEMORY_END {
         return None;
     }
     let end = start + len;
@@ -179,7 +179,7 @@ pub fn translated_byte_buffer(
         let mut vpn = start_va.floor();
         let Some(pte) = page_table.translate(vpn) else {
             println!("[pt]: find pte failed");
-            return None
+            return None;
         };
         match _ops {
             MapPermission::R => {
