@@ -48,19 +48,72 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
+
+    #[allow(unused)]
+    fn overlap_with(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        self.areas.iter().any(|a| {
+            let a_start = a.vpn_range.get_start();
+            let a_end = a.vpn_range.get_end();
+            start_va.floor() < a_end && end_va.ceil() > a_start
+        })
+    }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
         &mut self,
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) {
+    ) -> Result<(), isize> {
+        if !start_va.aligned() {
+            println!("[memory-set]: align failed for start va");
+            return Err(-1);
+        }
+
+        if end_va <= start_va {
+            return Err(-1);
+        }
+
+        let end_va = end_va.ceil().into();
+
+        if self.overlap_with(start_va, end_va) {
+            println!("[memory-set]: insert area with overlap.");
+            return Err(-1);
+        }
         self.push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         );
+        Ok(())
     }
-    /// remove a area
+
+    /// remove a area with specified range.
+    pub fn remove_area_with_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> Result<(),isize> {
+        if !start_va.aligned() {
+            println!("[memory-set]: align failed for start va");
+            return Err(-1);
+        }
+
+        if end_va <= start_va {
+            return Err(-1);
+        }
+
+        if let Some(index) = self.areas.iter().position(|a| {
+            a.vpn_range.get_start() == start_va.floor()
+                && a.vpn_range.get_end() == end_va.ceil()
+                && a.map_type == MapType::Framed
+        }) {
+            let mut a = self.areas.remove(index);
+            a.unmap(&mut self.page_table);
+            Ok(())
+        }  else {
+             Err(-1)
+        }
+    }
+    /// remove a area with specified start_vpn.
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
             .areas

@@ -1,4 +1,6 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
+use crate::config;
+
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 use alloc::string::String;
 use alloc::vec;
@@ -161,15 +163,26 @@ impl PageTable {
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+pub fn translated_byte_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
+    if start > config::MEMORY_END {
+        return None;
+    }
     let end = start + len;
     let mut v = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let Some(pte) = page_table.translate(vpn) else {
+            println!("[pt]: find pte failed");
+            return None
+        };
+        let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
@@ -180,7 +193,28 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         }
         start = end_va.into();
     }
-    v
+    Some(v)
+}
+
+/// Get data by copy from user space
+pub fn get_mut_data<T>(token: usize, ptr: *const T) -> Option<*mut T> {
+    let size = core::mem::size_of::<T>();
+    if size == 0 {
+        println!("[task]: get data with size == 0");
+        return None;
+    }
+
+    let Some(mut byte_buffers) = translated_byte_buffer(token, ptr as *const u8, size) else {
+        println!("[task]: get data failed");
+        return None;
+    };
+
+    if byte_buffers.iter().map(|b| b.len()).sum::<usize>() < size {
+        println!("[task]:get data with size < {}", size);
+        return None;
+    }
+
+    Some(byte_buffers[0].as_mut_ptr() as *mut T)
 }
 
 /// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
