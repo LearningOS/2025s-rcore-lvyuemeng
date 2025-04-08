@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, PRIORITY, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
@@ -26,6 +26,87 @@ pub struct TaskControlBlock {
     inner: UPSafeCell<TaskControlBlockInner>,
 }
 
+#[derive(Clone, Copy)]
+pub struct Pass {
+    pass: usize,
+    priority:usize,
+    stride: usize,
+}
+
+impl Pass {
+    #[allow(unused)]
+    fn new(priority: usize) -> Self {
+        Self {
+            pass: BIG_STRIDE / priority,
+            priority,
+            stride: 0,
+        }
+    }
+    
+    // get stride
+    pub fn get_stride(&self) -> usize {
+        self.stride
+    }
+
+    /// get pass for stride
+    pub fn get_pass(&self) -> usize {
+        self.pass
+    }
+    
+    /// get priority
+    pub fn get_priority(&self) -> usize {
+        self.priority
+    }
+
+    pub fn set_priority(&mut self, priority: usize) {
+        self.pass = BIG_STRIDE / priority;
+        self.priority = priority
+    }
+
+    pub fn add_stride(&mut self) {
+        self.stride = self.stride.wrapping_add(self.pass);
+        // println!("[pass]: add pass {}, result {}", self.pass, self.stride);
+    }
+}
+
+impl Default for Pass {
+    fn default() -> Self {
+        Self {
+            pass: BIG_STRIDE / PRIORITY,
+            priority: PRIORITY,
+            stride: 0,
+        }
+    }
+}
+
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
+        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
+        self_stride == other_stride
+    }
+}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
+        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
+        // reverse order
+        Some(self_stride.cmp(&other_stride).reverse())
+    }
+}
+
+impl Eq for TaskControlBlock {}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
+        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
+        // reverse order
+        self_stride.cmp(&other_stride).reverse()
+    }
+}
+
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
@@ -39,6 +120,9 @@ impl TaskControlBlock {
 }
 
 pub struct TaskControlBlockInner {
+    /// current stride has been passed
+    pub pass_data: Pass,
+
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
 
@@ -94,6 +178,14 @@ impl TaskControlBlockInner {
             self.fd_table.len() - 1
         }
     }
+    /// add stride
+    pub fn add_stride(&mut self) {
+        self.pass_data.add_stride();
+    }
+    
+    pub fn set_priority(&mut self, priority: usize) {
+        self.pass_data.set_priority(priority);
+    }
 }
 
 impl TaskControlBlock {
@@ -117,6 +209,7 @@ impl TaskControlBlock {
             kernel_stack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
+                    pass_data: Pass::default(),
                     trap_cx_ppn,
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
@@ -147,6 +240,63 @@ impl TaskControlBlock {
             kernel_stack_top,
             trap_handler as usize,
         );
+        task_control_block
+    }
+
+    /// Load a new elf and fork a new process to run it.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let mut parent_inner = self.inner_exclusive_access();
+
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    pass_data: Pass::default(),
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                    heap_bottom: parent_inner.heap_bottom,
+                    program_brk: parent_inner.program_brk,
+                })
+            },
+        });
+        parent_inner.children.push(task_control_block.clone());
+
+        // modify kernel_sp in trap_cx
+        // **** access child PCB exclusively
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            self.kernel_stack.get_top(),
+            trap_handler as usize,
+        );
+        // **** release inner automatically
+
         task_control_block
     }
 
@@ -188,6 +338,7 @@ impl TaskControlBlock {
             .unwrap()
             .ppn();
         // alloc a pid and a kernel stack in kernel space
+        let pass_data = parent_inner.pass_data;
         let pid_handle = pid_alloc();
         let kernel_stack = kstack_alloc();
         let kernel_stack_top = kernel_stack.get_top();
@@ -205,6 +356,7 @@ impl TaskControlBlock {
             kernel_stack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
+                    pass_data,
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
@@ -234,6 +386,18 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// get priority
+    pub fn get_priority(&self) -> usize {
+        let inner = self.inner_exclusive_access();
+        inner.pass_data.get_priority()
+    }
+
+    /// get current stride
+    pub fn get_stride(&self) -> usize {
+        let inner = self.inner_exclusive_access();
+        inner.pass_data.get_stride()
     }
 
     /// change the location of the program break. return None if failed.

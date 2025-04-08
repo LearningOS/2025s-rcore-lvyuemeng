@@ -22,11 +22,11 @@ mod switch;
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
 
-use crate::fs::{open_file, OpenFlags};
+use crate::{fs::{open_file, OpenFlags}, mm::{MapPermission, VirtAddr}};
 use alloc::sync::Arc;
 pub use context::TaskContext;
 use lazy_static::*;
-pub use manager::{fetch_task, TaskManager};
+pub use manager::fetch_task;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
@@ -36,6 +36,53 @@ pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
     Processor,
 };
+
+/// Allocate `len` bytes of memory in cur task.
+pub fn current_mmap(start: usize, len: usize, prot: usize) -> isize {
+    if prot & !0x7 != 0 || prot & 0x7 == 0 {
+        println!("[task]: mmap failed: invalid prot bits.");
+        return -1;
+    }
+    let mut perm = MapPermission::U;
+    if prot & 0x1 != 0 {
+        perm |= MapPermission::R
+    }
+    if prot & 0x2 != 0 {
+        perm |= MapPermission::W
+    }
+    if prot & 0x4 != 0 {
+        perm |= MapPermission::X
+    }
+
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(start + len);
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    let mut inner = task.inner_exclusive_access();
+    // assume no conflicts
+    if let Err(_) = inner.memory_set.insert_framed_area(start_va, end_va, perm) {
+        return -1;
+    }
+    // println!("[task]: create mmap successfully.");
+    0
+}
+
+/// Deallocate `len` bytes of memory in cur task.
+pub fn current_munmap(start: usize, len: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(start+len);
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    let mut inner = task.inner_exclusive_access();
+    // assume no conflicts
+    if let Err(_) = inner.memory_set.remove_area_with_range(start_va,end_va) {
+        return -1;
+    }
+    0
+}
+
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
     // There must be an application running.

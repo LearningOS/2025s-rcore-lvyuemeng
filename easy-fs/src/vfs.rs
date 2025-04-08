@@ -53,9 +53,11 @@ impl Inode {
                 DIRENT_SZ,
             );
             if dirent.name() == name {
+                log::debug!("find link: dirent found {}", dirent.name());
                 return Some(dirent.inode_id() as u32);
             }
         }
+        log::debug!("find link: dirent not found {}", name);
         None
     }
     /// Find inode under current inode by name
@@ -71,6 +73,131 @@ impl Inode {
                     self.block_device.clone(),
                 ))
             })
+        })
+    }
+    /// Block id
+    pub fn block_id(&self) -> usize {
+        self.block_id
+    }
+    /// Link numbers
+    pub fn nlink(&self) -> u32 {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.nlink)
+    }
+    /// Check if current inode is a directory
+    pub fn is_dir(&self) -> bool {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+    /// Check if current inode is a file
+    pub fn is_file(&self) -> bool {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.is_file())
+    }
+    /// Add a link to the specified inode
+    pub fn add_link(&self, name: &str, new_name: &str) -> Option<()> {
+        let mut fs = self.fs.lock();
+        self.add_entry(name, new_name, &mut fs)
+    }
+    /// Remove a link to the specified inode
+    pub fn remove_link(&self, name: &str) -> Option<()> {
+        let mut fs = self.fs.lock();
+        self.remove_entry(name, &mut fs)
+    }
+    /// Add a new entry
+    fn add_entry(
+        &self,
+        name: &str,
+        new_name: &str,
+        fs: &mut MutexGuard<EasyFileSystem>,
+    ) -> Option<()> {
+        self.modify_disk_inode(|disk_inode| {
+            assert!(disk_inode.is_dir());
+            // has the file been created?
+            let Some(inode_id) = self.find_inode_id(name, disk_inode).map(|inode_id| {
+                let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+                get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+                    .lock()
+                    .modify(block_offset, |disk_inode: &mut DiskInode| {
+                        disk_inode.nlink += 1;
+                    });
+
+                inode_id
+            }) else {
+                return None;
+            };
+            // append file in the dirent
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            // increase size
+            self.increase_size(new_size as u32, disk_inode, fs);
+            let dirent = DirEntry::new(new_name, inode_id);
+            disk_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+            let mut dirent = DirEntry::empty();
+            disk_inode.read_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes_mut(),
+                &self.block_device,
+            );
+            log::debug!("add link: dirent be added: {:?}", dirent.name());
+            Some(())
+        })
+    }
+    /// Remove an entry
+    fn remove_entry(&self, name: &str, fs: &mut MutexGuard<EasyFileSystem>) -> Option<()> {
+        self.modify_disk_inode(|disk_inode| {
+            assert!(disk_inode.is_dir());
+            if self.find_inode_id(name, disk_inode).is_none() {
+                return None;
+            }
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            let mut new_data = Vec::new();
+            // increase size
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ,
+                );
+                if dirent.name() == name {
+                    log::debug!("remove link: dirent be unlinked: {:?}", dirent.name());
+                    // remove link
+                    let (block_id, block_offset) = fs.get_disk_inode_pos(dirent.inode_id() as u32);
+                    get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+                        .lock()
+                        .modify(block_offset, |file_inode: &mut DiskInode| {
+                            file_inode.nlink -= 1;
+                            log::debug!(
+                                "remove link: dirent be unlinked nlink numbers: {}",
+                                file_inode.nlink
+                            );
+                            if file_inode.nlink == 0 {
+                                log::debug!("remove link: dirent be unlinked dealloc inode");
+                                let data_blocks = file_inode.clear_size(&self.block_device);
+                                for data_block in data_blocks.into_iter() {
+                                    fs.dealloc_data(data_block);
+                                }
+                            }
+                        });
+
+                    continue;
+                }
+                // log::debug!("remove link: dirent be kept: {:?}", dirent.name());
+                new_data.extend_from_slice(dirent.as_bytes());
+            }
+
+            disk_inode.clear_size(&self.block_device);
+            self.increase_size(new_data.len() as u32, disk_inode, fs);
+            // log::debug!("remove link: new size: {}", new_data.len());
+            disk_inode.write_at(0, &new_data, &self.block_device);
+            let mut dirent = DirEntry::empty();
+            disk_inode.read_at(0, dirent.as_bytes_mut(), &self.block_device);
+            log::debug!("remove link: first dirent: {:?}", dirent.name());
+            Some(())
         })
     }
     /// Increase the size of a disk inode
@@ -147,7 +274,7 @@ impl Inode {
             for i in 0..file_count {
                 let mut dirent = DirEntry::empty();
                 assert_eq!(
-                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device,),
+                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
                     DIRENT_SZ,
                 );
                 v.push(String::from(dirent.name()));
