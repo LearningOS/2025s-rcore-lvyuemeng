@@ -1,10 +1,9 @@
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translate_mut, translated_ref, translated_refmut, translated_str},
     task::{
-        current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-        suspend_current_and_run_next, SignalFlags,
-    },
+         add_task, current_mmap, current_munmap, current_process, current_task, current_user_token, exit_current_and_run_next, pid2process, suspend_current_and_run_next, SignalFlags
+    }, timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -156,7 +155,16 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let us = get_time_us();
+    let ts = translate_mut(token, _ts).unwrap();
+    unsafe {
+        *ts = TimeVal {
+            sec: us / 1_000_000,
+            usec: us % 1_000_000,
+        }
+    }
+    0
 }
 
 /// mmap syscall
@@ -167,7 +175,7 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
         "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    current_mmap(_start, _len, _port)
 }
 
 /// munmap syscall
@@ -178,7 +186,7 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    current_munmap(_start, _len)
 }
 
 /// change data segment size
@@ -198,7 +206,29 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(app_inode) = open_file(path.as_str(),OpenFlags::RDONLY) {
+        let data = &app_inode.read_all();
+        let task = current_task().unwrap();
+        let process = task.process.upgrade().unwrap();
+        log::debug!("kernel:pid[{}] sys_spawn", process.getpid());
+        let new_process = process.spawn(data);
+        let new_pid = new_process.getpid();
+        
+        let new_task = {
+            let new_process_inner = new_process.inner_exclusive_access();
+            new_process_inner.tasks[0].as_ref().unwrap().clone()
+        };
+        let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
+
+        trap_cx.x[10] = 0;
+        // add new task to scheduler
+        add_task(new_task.clone());
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 /// set priority syscall
@@ -209,5 +239,17 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let Some(task) = current_task() else {
+        return -1;
+    };
+
+    if _prio < 2 {
+        println!("[kernel]: Priority must be >= 2, but got {}", _prio);
+        return -1;
+    }
+
+    let mut inner = task.inner_exclusive_access();
+    inner.set_priority(_prio as usize);
+    // println!("Set priority to {}, turn out be: {}", _prio, task.get_priority());
+    return _prio;
 }

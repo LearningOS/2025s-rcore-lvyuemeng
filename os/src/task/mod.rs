@@ -21,6 +21,7 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::task::manager::add_stopping_task;
 use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
@@ -34,10 +35,56 @@ pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{add_task, pid2process, remove_from_pid2process, remove_task, wakeup_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, run_tasks, schedule, take_current_task,
+    current_user_token, run_tasks, schedule, take_current_task,current_tid
 };
 pub use signal::SignalFlags;
 pub use task::{TaskControlBlock, TaskStatus};
+
+/// Allocate `len` bytes of memory in cur task.
+pub fn current_mmap(start: usize, len: usize, prot: usize) -> isize {
+    if prot & !0x7 != 0 || prot & 0x7 == 0 {
+        println!("[task]: mmap failed: invalid prot bits.");
+        return -1;
+    }
+    let mut perm = MapPermission::U;
+    if prot & 0x1 != 0 {
+        perm |= MapPermission::R
+    }
+    if prot & 0x2 != 0 {
+        perm |= MapPermission::W
+    }
+    if prot & 0x4 != 0 {
+        perm |= MapPermission::X
+    }
+
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(start + len);
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    let process = task.process.upgrade().unwrap();
+    let mut process_inner = process.inner_exclusive_access();
+    if let Err(_) = process_inner.memory_set.insert_framed_area(start_va, end_va, perm) {
+        return -1;
+    }
+    // println!("[task]: create mmap successfully.");
+    0
+}
+
+/// Deallocate `len` bytes of memory in cur task.
+pub fn current_munmap(start: usize, len: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(start+len);
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    let process = task.process.upgrade().unwrap();
+    let mut process_inner = process.inner_exclusive_access();
+    if let Err(_) = process_inner.memory_set.remove_area_with_range(start_va,end_va) {
+        return -1;
+    }
+    0
+}
 
 /// Make current task suspended and switch to the next task
 pub fn suspend_current_and_run_next() {

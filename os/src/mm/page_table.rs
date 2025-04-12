@@ -1,4 +1,6 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
+use crate::config;
+
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 use alloc::string::String;
 use alloc::vec;
@@ -157,15 +159,22 @@ impl PageTable {
 }
 
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = start + len;
+    if start > config::MEMORY_END {
+        return None;
+    }
     let mut v = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        let Some(pte) = page_table.translate(vpn) else {
+            println!("[pt]: find pte failed");
+            return None
+        };
+        let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
@@ -176,8 +185,29 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         }
         start = end_va.into();
     }
-    v
+    Some(v)
 }
+
+/// translate a ptr in other address space to data in kernel address space, allow cross physical pages
+pub fn translate_mut<T>(token: usize, ptr: *const T) -> Option<*mut T> {
+    let size = core::mem::size_of::<T>();
+    if size == 0 {
+        println!("[task]: get data with size == 0");
+        return None;
+    }
+
+    let Some(mut byte_buffers) = translated_byte_buffer(token, ptr as *const u8, size) else {
+        println!("[task]: get data failed");
+        return None;
+    };
+
+    if byte_buffers.iter().map(|b| b.len()).sum::<usize>() < size {
+        println!("[task]:get data with size < {}", size);
+        return None;
+    }
+
+    Some(byte_buffers[0].as_mut_ptr() as *mut T)
+ }
 
 /// Create String in kernel address space from u8 Array(end with 0) in other address space
 pub fn translated_str(token: usize, ptr: *const u8) -> String {

@@ -5,43 +5,83 @@
 
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
 use crate::sync::UPSafeCell;
+use alloc::collections::binary_heap::BinaryHeap;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use lazy_static::*;
+
+pub trait TaskStorage {
+    fn new() -> Self;
+    fn add(&mut self, task: Arc<TaskControlBlock>);
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>>;
+    fn remove(&mut self, task: Arc<TaskControlBlock>);
+}
+
+impl TaskStorage for BinaryHeap<Arc<TaskControlBlock>> {
+    fn new() -> Self {
+        BinaryHeap::new()
+    }
+    fn add(&mut self, task: Arc<TaskControlBlock>) {
+        self.push(task);
+    }
+
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.pop()
+    }
+
+    fn remove(&mut self, task: Arc<TaskControlBlock>) {
+        self.retain(|t| Arc::as_ptr(t) != Arc::as_ptr(&task));
+    }
+}
+
+impl TaskStorage for VecDeque<Arc<TaskControlBlock>> {
+    fn new() -> Self {
+        VecDeque::new()
+    }
+    fn add(&mut self, task: Arc<TaskControlBlock>) {
+        self.push_back(task);
+    }
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.pop_front()
+    }
+    fn remove(&mut self, task: Arc<TaskControlBlock>) {
+        if let Some((id, _)) = self
+            .iter()
+            .enumerate()
+            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
+        {
+            self.remove(id);
+        }
+    }
+}
+
 ///A array of `TaskControlBlock` that is thread-safe
-pub struct TaskManager {
-    ready_queue: VecDeque<Arc<TaskControlBlock>>,
-    
+pub struct TaskManager<T: TaskStorage> {
+    ready_queue: T,
+
     /// The stopping task, leave a reference so that the kernel stack will not be recycled when switching tasks
     stop_task: Option<Arc<TaskControlBlock>>,
 }
 
 /// A simple FIFO scheduler.
-impl TaskManager {
+impl<T:TaskStorage> TaskManager<T> {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
         Self {
-            ready_queue: VecDeque::new(),
+            ready_queue: TaskStorage::new(),
             stop_task: None,
         }
     }
     /// Add process back to ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
-        self.ready_queue.push_back(task);
+        self.ready_queue.add(task);
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        self.ready_queue.fetch()
     }
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
-        if let Some((id, _)) = self
-            .ready_queue
-            .iter()
-            .enumerate()
-            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
-        {
-            self.ready_queue.remove(id);
-        }
+        self.ready_queue.remove(task);
     }
     /// Add a task to stopping task
     pub fn add_stop(&mut self, task: Arc<TaskControlBlock>) {
@@ -50,12 +90,15 @@ impl TaskManager {
         // case) so that we can simply replace it;
         self.stop_task = Some(task);
     }
-
 }
+
+type TaskManagerHeap = TaskManager<BinaryHeap<Arc<TaskControlBlock>>>;
+#[allow(unused)]
+type TaskManagerDeque = TaskManager<VecDeque<Arc<TaskControlBlock>>>;
 
 lazy_static! {
     /// TASK_MANAGER instance through lazy_static!
-    pub static ref TASK_MANAGER: UPSafeCell<TaskManager> =
+    pub static ref TASK_MANAGER: UPSafeCell<TaskManagerHeap> =
         unsafe { UPSafeCell::new(TaskManager::new()) };
     /// PID2PCB instance (map of pid to pcb)
     pub static ref PID2PCB: UPSafeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =

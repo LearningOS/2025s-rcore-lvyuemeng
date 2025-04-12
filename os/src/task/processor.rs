@@ -58,6 +58,7 @@ pub fn run_tasks() {
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            task_inner.add_stride();
             task_inner.task_status = TaskStatus::Running;
             // release coming task_inner manually
             drop(task_inner);
@@ -77,6 +78,16 @@ pub fn run_tasks() {
 /// Get current task through take, leaving a None in its place
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     PROCESSOR.exclusive_access().take_current()
+}
+
+/// Get current task's TID
+pub fn current_tid() -> Option<usize> {
+    let task = PROCESSOR.exclusive_access().current();
+    if let Some(task) = task {
+        Some(task.inner_exclusive_access().res.as_ref().unwrap().tid)
+    } else {
+        None
+    }
 }
 
 /// Get a copy of the current task

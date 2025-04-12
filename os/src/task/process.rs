@@ -7,7 +7,7 @@ use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
-use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
+use crate::sync::{Condvar, DeadDetector, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -43,6 +43,8 @@ pub struct ProcessControlBlockInner {
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     /// task resource allocator
     pub task_res_allocator: RecycleAllocator,
+    /// dead lock detector
+    pub dead_detector: DeadDetector,
     /// mutex list
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     /// semaphore list
@@ -116,6 +118,7 @@ impl ProcessControlBlock {
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
+                    dead_detector: DeadDetector::default(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
@@ -242,6 +245,7 @@ impl ProcessControlBlock {
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
+                    dead_detector: DeadDetector::default(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
@@ -273,6 +277,75 @@ impl ProcessControlBlock {
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
         drop(task_inner);
+        insert_into_pid2process(child.getpid(), Arc::clone(&child));
+        // add this thread to scheduler
+        add_task(task);
+        child
+    }
+    /// Support only process with a single thread
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        trace!("kernel: fork");
+        let mut parent = self.inner_exclusive_access();
+        assert_eq!(parent.thread_count(), 1);
+        // alloc a pid
+        let pid = pid_alloc();
+        // create child process pcb
+        let child = Arc::new(Self {
+            pid,
+            inner: unsafe {
+                UPSafeCell::new(ProcessControlBlockInner {
+                    is_zombie: false,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                    signals: SignalFlags::empty(),
+                    tasks: Vec::new(),
+                    task_res_allocator: RecycleAllocator::new(),
+                    dead_detector: DeadDetector::default(),
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
+                })
+            },
+        });
+        // add child
+        parent.children.push(Arc::clone(&child));
+        drop(parent);
+        let task = Arc::new(TaskControlBlock::new(
+            Arc::clone(&child),
+            ustack_base,
+            true,
+        ));
+        log::debug!("kernel: spawn .. task created");
+        // prepare trap_cx of main thread
+        let task_inner = task.inner_exclusive_access();
+        let trap_cx = task_inner.get_trap_cx();
+        let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
+        let kstack_top = task.kstack.get_top();
+        drop(task_inner);
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            ustack_top,
+            KERNEL_SPACE.exclusive_access().token(),
+            kstack_top,
+            trap_handler as usize,
+        );
+        log::debug!("kernel: spawn .. trap_cx prepared");
+        // attach task to child process
+        let mut child_inner = child.inner_exclusive_access();
+        child_inner.tasks.push(Some(Arc::clone(&task)));
+        drop(child_inner);
+
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);

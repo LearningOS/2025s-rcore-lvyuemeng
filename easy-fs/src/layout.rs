@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
 
 const EFS_MAGIC: u32 = 0x3b800001;
-const INODE_DIRECT_COUNT: usize = 28;
+const INODE_DIRECT_COUNT: usize = 27;
 const NAME_LENGTH_LIMIT: usize = 27;
 const INODE_INDIRECT1_COUNT: usize = BLOCK_SZ / 4;
 const INODE_INDIRECT2_COUNT: usize = INODE_INDIRECT1_COUNT * INODE_INDIRECT1_COUNT;
@@ -94,6 +94,8 @@ type DataBlock = [u8; BLOCK_SZ];
 pub struct DiskInode {
     /// file size
     pub size: u32,
+    /// link count
+    pub nlink: u32,
     /// array of direct block id
     pub direct: [u32; INODE_DIRECT_COUNT],
     /// one-level indirect block id
@@ -111,6 +113,7 @@ impl DiskInode {
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
+        self.nlink = 1;
         self.type_ = type_;
     }
     /// inode is directory?
@@ -405,6 +408,7 @@ impl DiskInode {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone)]
 /// Directory entry struct
 pub struct DirEntry {
     /// File name

@@ -2,6 +2,7 @@
 
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
+use crate::config::{BIG_STRIDE, PRIORITY};
 use crate::trap::TrapContext;
 use crate::{mm::PhysPageNum, sync::UPSafeCell};
 use alloc::sync::{Arc, Weak};
@@ -15,6 +16,87 @@ pub struct TaskControlBlock {
     pub kstack: KernelStack,
     /// mutable
     inner: UPSafeCell<TaskControlBlockInner>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Pass {
+    pass: usize,
+    priority:usize,
+    stride: usize,
+}
+
+impl Pass {
+    #[allow(unused)]
+    fn new(priority: usize) -> Self {
+        Self {
+            pass: BIG_STRIDE / priority,
+            priority,
+            stride: 0,
+        }
+    }
+    
+    // get stride
+    pub fn get_stride(&self) -> usize {
+        self.stride
+    }
+
+    /// get pass for stride
+    pub fn get_pass(&self) -> usize {
+        self.pass
+    }
+    
+    /// get priority
+    pub fn get_priority(&self) -> usize {
+        self.priority
+    }
+
+    pub fn set_priority(&mut self, priority: usize) {
+        self.pass = BIG_STRIDE / priority;
+        self.priority = priority
+    }
+
+    pub fn add_stride(&mut self) {
+        self.stride = self.stride.wrapping_add(self.pass);
+        // println!("[pass]: add pass {}, result {}", self.pass, self.stride);
+    }
+}
+
+impl Default for Pass {
+    fn default() -> Self {
+        Self {
+            pass: BIG_STRIDE / PRIORITY,
+            priority: PRIORITY,
+            stride: 0,
+        }
+    }
+}
+
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
+        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
+        self_stride == other_stride
+    }
+}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
+        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
+        // reverse order
+        Some(self_stride.cmp(&other_stride).reverse())
+    }
+}
+
+impl Eq for TaskControlBlock {}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let self_stride = self.inner_exclusive_access().pass_data.get_stride();
+        let other_stride = other.inner_exclusive_access().pass_data.get_stride();
+        // reverse order
+        self_stride.cmp(&other_stride).reverse()
+    }
 }
 
 impl TaskControlBlock {
@@ -32,6 +114,7 @@ impl TaskControlBlock {
 
 pub struct TaskControlBlockInner {
     pub res: Option<TaskUserRes>,
+    pub pass_data: Pass,
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
     /// Save task context
@@ -44,6 +127,14 @@ pub struct TaskControlBlockInner {
 }
 
 impl TaskControlBlockInner {
+    /// add stride
+    pub fn add_stride(&mut self) {
+        self.pass_data.add_stride();
+    }
+    
+    pub fn set_priority(&mut self, priority: usize) {
+        self.pass_data.set_priority(priority);
+    }
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
         self.trap_cx_ppn.get_mut()
     }
@@ -70,6 +161,7 @@ impl TaskControlBlock {
             kstack,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
+                    pass_data: Pass::default(),
                     res: Some(res),
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),
@@ -78,6 +170,18 @@ impl TaskControlBlock {
                 })
             },
         }
+    }
+
+    /// get priority
+    pub fn get_priority(&self) -> usize {
+        let inner = self.inner_exclusive_access();
+        inner.pass_data.get_priority()
+    }
+
+    /// get current stride
+    pub fn get_stride(&self) -> usize {
+        let inner = self.inner_exclusive_access();
+        inner.pass_data.get_stride()
     }
 }
 

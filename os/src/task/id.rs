@@ -90,7 +90,7 @@ pub fn kstack_alloc() -> KernelStack {
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
-    );
+    ).unwrap();
     KernelStack(kstack_id)
 }
 
@@ -173,7 +173,7 @@ impl TaskUserRes {
             ustack_bottom.into(),
             ustack_top.into(),
             MapPermission::R | MapPermission::W | MapPermission::U,
-        );
+        ).unwrap();
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
@@ -181,7 +181,7 @@ impl TaskUserRes {
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
-        );
+        ).unwrap();
     }
     /// Deallocate user resource for a task
     fn dealloc_user_res(&self) {

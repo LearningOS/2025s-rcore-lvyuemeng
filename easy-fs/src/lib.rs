@@ -17,6 +17,7 @@
 #![no_std]
 
 extern crate alloc;
+extern crate log;
 
 pub mod bitmap;
 pub mod block_cache;
